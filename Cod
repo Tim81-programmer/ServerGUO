@@ -1,0 +1,156 @@
+
+import argparse
+import ipaddress
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+THRESHOLD = 5
+
+# Типи подій, які вважаємо невдалими спробами SSH-входу.
+FAILED_LOGIN_PATTERN = re.compile(
+    r"Failed password|Failed publickey|"
+    r"Failed keyboard-interactive|authentication failure|"
+    r"maximum authentication attempts exceeded",
+    re.IGNORECASE,
+)
+
+# Шукаємо IP після слова from або параметра rhost=.
+IP_SOURCE_PATTERN = re.compile(
+    r"\bfrom\s+(\S+)|\brhost=(\S+)",
+    re.IGNORECASE,
+)
+
+
+def extract_ip(line):
+    """Повертає IP-адресу з рядка або None."""
+    match = IP_SOURCE_PATTERN.search(line)
+
+    if not match:
+        return None
+
+    candidate = (match.group(1) or match.group(2))
+    candidate = candidate.strip("[](),;")
+
+    # Видаляємо кінцеву кому або крапку, але не двокрапки IPv6.
+    candidate = candidate.rstrip(",;")
+
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def analyze_log(log_path):
+    """Читає лог і повертає статистику невдалих входів."""
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as file:
+            lines = file.readlines()
+    except FileNotFoundError:
+        raise ValueError(f"Файл не знайдено: {log_path}")
+    except IsADirectoryError:
+        raise ValueError(f"Замість файлу вказано папку: {log_path}")
+    except PermissionError:
+        raise ValueError(f"Немає доступу до файлу: {log_path}")
+    except OSError as error:
+        raise ValueError(f"Не вдалося прочитати файл: {error}")
+
+    if not lines or not any(line.strip() for line in lines):
+        raise ValueError("Лог порожній.")
+
+    attempts = Counter()
+    malformed = 0
+    failed_events = 0
+
+    for line in lines:
+        if not FAILED_LOGIN_PATTERN.search(line):
+            continue
+
+        failed_events += 1
+        ip = extract_ip(line)
+
+        if ip is None:
+            malformed += 1
+            continue
+
+        attempts[ip] += 1
+
+    suspicious_ips = [
+        {"ip": ip, "attempts": count}
+        for ip, count in sorted(attempts.items())
+        if count >= THRESHOLD
+    ]
+
+    return {
+        "threshold": THRESHOLD,
+        "total_lines": len(lines),
+        "failed_events": failed_events,
+        "counted_attempts": sum(attempts.values()),
+        "malformed_failed_events": malformed,
+        "suspicious_ips": suspicious_ips,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ServerGuard — аналізатор невдалих SSH-входів."
+    )
+    parser.add_argument(
+        "logfile",
+        help="Шлях до файлу з SSH-логами",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="serverguard_report.json",
+        help="Шлях до JSON-звіту (за замовчуванням: serverguard_report.json)",
+    )
+
+    args = parser.parse_args()
+
+    log_path = Path(args.logfile)
+    output_path = Path(args.output)
+
+    try:
+        report = analyze_log(log_path)
+    except ValueError as error:
+        print(f"Помилка: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(report, file, ensure_ascii=False, indent=4)
+            file.write("\n")
+    except OSError as error:
+        print(
+            f"Не вдалося зберегти JSON-звіт: {error}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Аналіз завершено.")
+    print(f"Усього рядків: {report['total_lines']}")
+    print(f"Невдалих подій входу: {report['failed_events']}")
+    print(f"Підрахованих спроб з IP: {report['counted_attempts']}")
+    print(
+        "Подій без коректної IP-адреси: "
+        f"{report['malformed_failed_events']}"
+    )
+
+    if report["suspicious_ips"]:
+        print("\nПідозрілі IP-адреси:")
+
+        for item in report["suspicious_ips"]:
+            print(f"  {item['ip']} — {item['attempts']} спроб")
+    else:
+        print("\nПідозрілих IP-адрес не знайдено.")
+
+    print(f"\nJSON-звіт збережено: {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
